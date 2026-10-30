@@ -1,0 +1,4 @@
+kavita-sync.conf
+*.local.conf
+tests/tmp/
+.work/

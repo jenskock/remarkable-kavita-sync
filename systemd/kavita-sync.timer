@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Kavita sync after boot and once a day
+
+[Timer]
+OnBootSec=3min
+OnCalendar=daily
+Persistent=true
+AccuracySec=15min
+
+[Install]
+WantedBy=timers.target
