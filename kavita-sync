@@ -1,0 +1,170 @@
+#!/bin/sh
+# Mirror a Kavita library onto a reMarkable 2 for Plato.
+# Target shell: BusyBox ash (/bin/sh on the tablet). No bash, Python, or jq.
+
+set -eu -f
+
+script=$0
+if [ -L "$script" ] && command -v readlink >/dev/null 2>&1; then
+    target=$(readlink "$script" 2>/dev/null || true)
+    if [ -n "$target" ]; then
+        case $target in
+            /*) script=$target ;;
+            *) script=$(dirname -- "$script")/$target ;;
+        esac
+    fi
+fi
+if command -v readlink >/dev/null 2>&1; then
+    resolved=$(readlink -f "$script" 2>/dev/null || true)
+    if [ -n "$resolved" ]; then
+        script=$resolved
+    fi
+fi
+BASE=$(CDPATH='' cd -- "$(dirname -- "$script")" && pwd)
+
+# shellcheck source=lib/util.sh
+. "$BASE/lib/util.sh"
+# shellcheck source=lib/http.sh
+. "$BASE/lib/http.sh"
+# shellcheck source=lib/sync.sh
+. "$BASE/lib/sync.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: kavita-sync [--config FILE] [--dry-run] [--delete] [--force] [--verbose]
+
+Mirror Kavita OPDS books into DEST (default /home/root/plato-media).
+
+  --config FILE   config file (default: /home/root/.config/kavita-sync.conf)
+  --dry-run       list actions; do not download, delete, or update the manifest
+  --delete        remove tracked local books that are no longer on the server
+  --force         download every file even when it looks unchanged
+  --verbose       log each catalogue request
+  --help          show this help
+
+Exit status: 0 ok, 1 sync error, 2 usage or config error, 3 already running.
+EOF
+}
+
+resolve_config_path() {
+    if [ -n "$CONFIG" ]; then
+        return 0
+    fi
+    if [ -n "${KAVITA_SYNC_CONFIG:-}" ]; then
+        CONFIG=$KAVITA_SYNC_CONFIG
+    elif [ -f /home/root/.config/kavita-sync.conf ]; then
+        CONFIG=/home/root/.config/kavita-sync.conf
+    elif [ -f "$BASE/kavita-sync.conf" ]; then
+        CONFIG=$BASE/kavita-sync.conf
+    else
+        CONFIG=/home/root/.config/kavita-sync.conf
+    fi
+}
+
+main() {
+    local help delete_cli
+    help=0
+    DRY=0
+    DELETE=0
+    FORCE=0
+    VERBOSE=0
+    CONFIG=""
+    delete_cli=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -h|--help)
+                help=1
+                shift
+                ;;
+            --dry-run)
+                DRY=1
+                shift
+                ;;
+            --delete)
+                delete_cli=1
+                shift
+                ;;
+            --force)
+                FORCE=1
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --config)
+                if [ $# -lt 2 ]; then
+                    usage_die "--config needs a file"
+                fi
+                CONFIG=$2
+                shift 2
+                ;;
+            --config=*)
+                CONFIG=${1#--config=}
+                shift
+                ;;
+            *)
+                usage_die "unknown option: $1"
+                ;;
+        esac
+    done
+    if [ "$help" = 1 ]; then
+        usage
+        exit 0
+    fi
+    resolve_config_path
+    SERVER_URL=""
+    API_KEY=""
+    DEST=""
+    LAYOUT=""
+    STATE_DIR=""
+    DELETE_MISSING=0
+    USER_AGENT=""
+    CA_CERT=""
+    INSECURE=0
+    load_config
+    validate_config
+    if [ "$delete_cli" = 1 ] || is_true "$DELETE_MISSING"; then
+        DELETE=1
+    fi
+    umask 077
+    acquire_lock
+    trap cleanup EXIT INT TERM
+    setup_work
+    pick_client
+    init_manifest
+    PARSE_SEQ=0
+    downloaded=0
+    unchanged=0
+    deleted=0
+    errors=0
+    CRAWL_OK=0
+    if [ "$DRY" != 1 ]; then
+        mkdir -p -- "$DEST"
+    fi
+    log info "sync start dest=$DEST layout=$LAYOUT dry_run=$DRY delete=$DELETE"
+    if ! crawl; then
+        CRAWL_OK=0
+        errors=$((errors + 1))
+    fi
+    dedupe_books || errors=$((errors + 1))
+    download_all || errors=$((errors + 1))
+    if [ "$DELETE" = 1 ] && [ "$CRAWL_OK" = 1 ] && [ "$errors" -eq 0 ]; then
+        prune || errors=$((errors + 1))
+    elif [ "$DELETE" = 1 ]; then
+        log warn "not deleting local files because the sync had errors"
+    fi
+    if [ "$DRY" != 1 ]; then
+        commit_manifest || errors=$((errors + 1))
+    fi
+    if [ "$DRY" = 1 ]; then
+        log info "dry-run finished: would_download=$downloaded would_skip=$unchanged would_delete=$deleted errors=$errors"
+    else
+        log info "finished: downloaded=$downloaded unchanged=$unchanged deleted=$deleted errors=$errors"
+    fi
+    if [ "$errors" -ne 0 ] || [ "$CRAWL_OK" != 1 ]; then
+        exit 1
+    fi
+}
+
+main "$@"

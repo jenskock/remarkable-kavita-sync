@@ -1,0 +1,5 @@
+shell=sh
+external-sources=true
+# `local` is not POSIX, but it is implemented by BusyBox ash (/bin/sh on the
+# reMarkable) and by dash. The scripts are written for those shells.
+disable=SC3043
